@@ -2,14 +2,22 @@ var url = require('url');
 var scClient = require('socketcluster-client');
 var EventEmitter = require('events').EventEmitter;
 
-var trailingPortNumberRegex = /:[0-9]+$/
+var trailingPortNumberRegex = /:[0-9]+$/;
 
+// --------------------------
+// ClusterBrokerClient
+// --------------------------
+/**
+ * @param broker
+ * @param options
+ * @constructor
+ */
 var ClusterBrokerClient = function (broker, options) {
   EventEmitter.call(this);
-  this.subMappers = [];
+  this.subMappers = []; // [{mapper: function, clients: url<->socket, targets: targetURIs}]
   this.pubMappers = [];
   this.broker = broker;
-  this.targetClients = {};
+  this.targetClients = {}; // clientURI <-> remote socketcluster-client
   this.authKey = options.authKey || null;
 
   this._handleClientError = (err) => {
@@ -26,7 +34,10 @@ ClusterBrokerClient.prototype.errors = {
     return err;
   }
 };
-
+/**
+ * @param {string} uri ws://[::ffff:120.26.164.224]:8100
+ * @return {{hostname: string | void | *, port}}
+ */
 ClusterBrokerClient.prototype.breakDownURI = function (uri) {
   var parsedURI = url.parse(uri);
   var hostname = parsedURI.host.replace(trailingPortNumberRegex, '');
@@ -34,12 +45,18 @@ ClusterBrokerClient.prototype.breakDownURI = function (uri) {
     hostname: hostname,
     port: parsedURI.port
   };
-  if (parsedURI.protocol == 'wss:' || parsedURI.protocol == 'https:') {
+  if (parsedURI.protocol === 'wss:' || parsedURI.protocol === 'https:') {
     result.secure = true;
   }
   return result;
 };
-
+/**
+ * @param mapperList
+ * @param mapper
+ * @param {string[]} targetURIs scc-broker 服务器列表
+ * @return {{mapper: *, clients: {}, targets: *}}
+ * @private
+ */
 ClusterBrokerClient.prototype._mapperPush = function (mapperList, mapper, targetURIs) {
   var clientMap = {};
 
@@ -48,6 +65,14 @@ ClusterBrokerClient.prototype._mapperPush = function (mapperList, mapper, target
     clientConnectOptions.query = {
       authKey: this.authKey
     };
+
+    /**
+     * 连接远程 state server
+     * _mapperPush: { hostname: '[::ffff:127.0.0.1]',
+     *   port: '8100',
+     *   query: { authKey: null }
+     * }
+     */
     var client = scClient.connect(clientConnectOptions);
     client.removeListener('error', this._handleClientError);
     client.on('error', this._handleClientError);
@@ -58,7 +83,7 @@ ClusterBrokerClient.prototype._mapperPush = function (mapperList, mapper, target
 
   var mapperContext = {
     mapper: mapper,
-    clients: clientMap,
+    clients: clientMap, // clientURI(string)<->socket
     targets: targetURIs
   };
 
@@ -80,16 +105,16 @@ ClusterBrokerClient.prototype._getAllBrokerSubscriptions = function () {
 };
 
 ClusterBrokerClient.prototype.getAllSubscriptions = function () {
-  var visitedClientsLookup = {};
-  var channelsLookup = {};
-  var subscriptions = [];
+  var visitedClientsLookup = {}; // 已经遍历过的 clientURI
+  var channelsLookup = {};       // channelName 不重复指定
+  var subscriptions = [];        // 所有订阅的名称
 
   this.subMappers.forEach((mapperContext) => {
     Object.keys(mapperContext.clients).forEach((clientURI) => {
       var client = mapperContext.clients[clientURI];
       if (!visitedClientsLookup[clientURI]) {
         visitedClientsLookup[clientURI] = true;
-        var subs = client.subscriptions(true);
+        var subs = client.subscriptions(true); // socketcluster-client.subscriptions()
         subs.forEach((channelName) => {
           if (!channelsLookup[channelName]) {
             channelsLookup[channelName] = true;
@@ -131,7 +156,10 @@ ClusterBrokerClient.prototype._cleanupUnusedTargetSockets = function () {
     }
   });
 };
-
+/**
+ * @param mapper     一个把名字分配到 instance 的 hash 产生器
+ * @param targetURIs broker 服务器列表
+ */
 ClusterBrokerClient.prototype.subMapperPush = function (mapper, targetURIs) {
   var mapperContext = this._mapperPush(this.subMappers, mapper, targetURIs);
   mapperContext.subscriptions = {};

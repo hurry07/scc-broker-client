@@ -10,7 +10,11 @@ var DEFAULT_STATE_SERVER_ACK_TIMEOUT = 2000;
 
 var DEFAULT_RECONNECT_RANDOMNESS = 1000;
 
-// The options object needs to have a stateServerHost property.
+/**
+ * @param {*} broker
+ * @param {*} options The options object needs to have a stateServerHost property.
+ * @return {ClusterBrokerClient}
+ */
 module.exports.attach = function (broker, options) {
   var reconnectRandomness = options.stateServerReconnectRandomness || DEFAULT_RECONNECT_RANDOMNESS;
   var authKey = options.authKey || null;
@@ -23,13 +27,19 @@ module.exports.attach = function (broker, options) {
   }
 
   var latestSnapshotTime = -1;
-  var latestServerInstancesSnapshot = '[]';
-  var serverInstances = [];
+  var latestServerInstancesSnapshot = '[]'; // 上次接受的 broker server 列表
+  var serverInstances = []; // 所有远程 broker 服务器列表
   var processedMessagesLookup = {};
   var messageCacheDuration = options.brokerMessageCacheDuration || DEFAULT_MESSAGE_CACHE_DURATION;
   var retryDelay = options.brokerRetryDelay || DEFAULT_RETRY_DELAY;
 
+  /**
+   * server 端 broker 服务器列表发生变化通知客户端
+   * @param updatePacket
+   * @return {boolean}
+   */
   var updateServerCluster = function (updatePacket) {
+    // broker server urls { serverInstances: [ 'ws://[::ffff:127.0.0.1]:8100' ], time: 1516356554492 }
     var newServerInstancesSnapshot = JSON.stringify(updatePacket.serverInstances);
     if (updatePacket.time > latestSnapshotTime && newServerInstancesSnapshot !== latestServerInstancesSnapshot) {
       latestServerInstancesSnapshot = newServerInstancesSnapshot;
@@ -40,6 +50,7 @@ module.exports.attach = function (broker, options) {
     return false;
   };
 
+  // 连接 state server
   var scStateSocketOptions = {
     hostname: options.stateServerHost, // Required option
     port: options.stateServerPort || DEFAULT_PORT,
@@ -55,11 +66,17 @@ module.exports.attach = function (broker, options) {
       authKey: authKey
     }
   };
+
+  // 连接到 scc state server, 然后 server 返回 broker server url
   var stateSocket = scClient.connect(scStateSocketOptions);
   stateSocket.on('error', function (err) {
     clusterClient.emit('error', err);
   });
 
+  /**
+   * 用 broker 初始化描述对象
+   * @type {{instanceId: *, instanceIp:*, instanceIpFamily:*}}
+   */
   var stateSocketData = {
     instanceId: broker.instanceId
   };
@@ -97,6 +114,11 @@ module.exports.attach = function (broker, options) {
     });
   };
 
+  /**
+   * scc-broker 上线或者离线
+   * @param data
+   * @param respond
+   */
   var addNewSubMapping = function (data, respond) {
     var updated = updateServerCluster(data);
     if (updated) {
@@ -134,14 +156,17 @@ module.exports.attach = function (broker, options) {
   stateSocket.on('serverJoinCluster', addNewSubMapping);
   stateSocket.on('serverLeaveCluster', addNewSubMapping);
 
+  /**
+   * 远程 client set state 时候触发
+   */
   stateSocket.on('clientStatesConverge', function (data, respond) {
-    if (data.state == 'updatedSubs:' + JSON.stringify(serverInstances)) {
+    if (data.state === 'updatedSubs:' + JSON.stringify(serverInstances)) {
       clusterClient.pubMapperPush(serverMapper, serverInstances);
       while (clusterClient.pubMappers.length > 1) {
         clusterClient.pubMapperShift();
       }
       sendClientState('updatedPubs');
-    } else if (data.state == 'updatedPubs:' + JSON.stringify(serverInstances)) {
+    } else if (data.state === 'updatedPubs:' + JSON.stringify(serverInstances)) {
       completeMappingUpdates();
     }
     respond();
@@ -167,7 +192,7 @@ module.exports.attach = function (broker, options) {
   };
 
   var clusterMessageHandler = function (channelName, packet) {
-    if ((packet.sender == null || packet.sender != broker.instanceId) && packet.messages && packet.messages.length) {
+    if ((packet.sender == null || packet.sender !== broker.instanceId) && packet.messages && packet.messages.length) {
       if (processedMessagesLookup[packet.id] == null) {
         packet.messages.forEach(function (data) {
           broker.publish(channelName, data);
@@ -204,6 +229,9 @@ module.exports.attach = function (broker, options) {
     publishTimeout = null;
   };
 
+  /**
+   * publish 消息, 发送到远程
+   */
   broker.on('publish', function (channelName, data) {
     if (broker.options.pubSubBatchDuration == null) {
       var packet = {
@@ -212,6 +240,7 @@ module.exports.attach = function (broker, options) {
         id: uuid.v4()
       };
       clusterClient.publish(channelName, packet);
+
     } else {
       if (!publishOutboundBuffer[channelName]) {
         publishOutboundBuffer[channelName] = [];
@@ -223,5 +252,6 @@ module.exports.attach = function (broker, options) {
       }
     }
   });
+
   return clusterClient;
 };
